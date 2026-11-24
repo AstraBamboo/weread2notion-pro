@@ -1,3 +1,4 @@
+from weread2notionpro.sync_policy import eligible_duration
 import pendulum
 from weread2notionpro.notion_helper import NotionHelper
 from weread2notionpro.weread_api import WeReadApi
@@ -50,7 +51,7 @@ def insert_book_to_notion(books, index, bookId):
     )
     book["开始阅读时间"] = book.get("beginReadingDate")
     book["最后阅读时间"] = book.get("lastReadingDate")
-    cover = book.get("cover").replace("/s_", "/t7_")
+    cover = (book.get("cover") or "").replace("/s_", "/t7_")
     if not cover or not cover.strip() or not cover.startswith("http"):
         cover = BOOK_ICON_URL
     if bookId not in notion_books:
@@ -125,6 +126,8 @@ def insert_read_data(page_id, readTimes):
 
 
 def insert_to_notion(page_id, timestamp, duration, book_database_id):
+    if not eligible_duration(duration):
+        return
     parent = {"database_id": notion_helper.read_database_id, "type": "database_id"}
     properties = {
         "标题": utils.get_title(
@@ -149,20 +152,23 @@ def insert_to_notion(page_id, timestamp, duration, book_database_id):
         )
 
 
-weread_api = WeReadApi()
-notion_helper = NotionHelper()
+weread_api = None
+notion_helper = None
 archive_dict = {}
 notion_books = {}
 
 
 def main():
+    global weread_api, notion_helper
+    weread_api = WeReadApi()
+    notion_helper = NotionHelper()
     global notion_books
     global archive_dict
     bookshelf_books = weread_api.get_bookshelf()
     notion_books = notion_helper.get_all_book()
-    bookProgress = bookshelf_books.get("bookProgress")
+    bookProgress = bookshelf_books.get("bookProgress", [])
     bookProgress = {book.get("bookId"): book for book in bookProgress}
-    for archive in bookshelf_books.get("archive"):
+    for archive in bookshelf_books.get("archive", []):
         name = archive.get("name")
         bookIds = archive.get("bookIds")
         archive_dict.update({bookId: name for bookId in bookIds})

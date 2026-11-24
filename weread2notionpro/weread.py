@@ -233,9 +233,12 @@ def append_blocks_to_notion(id, blocks, after, contents):
         l.append(content)
     return l
 
-weread_api = WeReadApi()
-notion_helper = NotionHelper()
+weread_api = None
+notion_helper = None
 def main():
+    global weread_api, notion_helper
+    weread_api = WeReadApi()
+    notion_helper = NotionHelper()
     notion_books = notion_helper.get_all_book()
     books = weread_api.get_notebooklist()
     if books != None:
