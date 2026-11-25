@@ -2,22 +2,28 @@ name: read time sync
 
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only check APIs and existing databases; do not write"
+        type: boolean
+        default: true
   schedule:
-    - cron: "0 */3 * * *"
+    - cron: "0 5,15 * * 0"  # Sunday 13:00 and 23:00 Asia/Shanghai
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: weread-notion-sync
+  cancel-in-progress: false
+permissions:
+  contents: read
 jobs:
   sync:
     name: Sync
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       NOTION_PAGE: ${{ secrets.NOTION_PAGE }}
+      WEREAD_API_KEY: ${{ secrets.WEREAD_API_KEY }}
       WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
-      CC_URL: ${{ secrets.CC_URL }}
-      CC_ID: ${{ secrets.CC_ID }}
-      CC_PASSWORD: ${{ secrets.CC_PASSWORD }}
       HEATMAP_BLOCK_ID: ${{ secrets.HEATMAP_BLOCK_ID }}
       BOOK_DATABASE_NAME: ${{ vars.BOOK_DATABASE_NAME }}
       AUTHOR_DATABASE_NAME: ${{ vars.AUTHOR_DATABASE_NAME }}
@@ -43,30 +49,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Remove folder
-        run: rm -rf ./OUT_FOLDER
-      - name: Set default year if not provided
-        run: echo "YEAR=$(date +"%Y")" >> $GITHUB_ENV
-        if: env.YEAR == ''
-      - name: weread heatmap
-        run: |
-          github_heatmap weread  --year $YEAR  --me "${{secrets.NAME}}" --without-type-name --background-color=${{ vars.background_color||'#FFFFFF'}} --track-color=${{ vars.track_color||'#ACE7AE'}} --special-color1=${{ vars.special_color||'#69C16E'}} --special-color2=${{ vars.special_color2||'#549F57'}} --dom-color=${{ vars.dom_color||'#EBEDF0'}} --text-color=${{ vars.text_color||'#000000'}}
-      - name: Rename weread.svg to a random name
-        run: |
-          cd OUT_FOLDER
-          find . -type f ! -name "weread.svg" -exec rm -f {} +
-          cd ..
-          RANDOM_FILENAME=$(uuidgen).svg
-          mv ./OUT_FOLDER/weread.svg ./OUT_FOLDER/$RANDOM_FILENAME
-          echo "Renamed file to $RANDOM_FILENAME"
-      - name: push
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add .
-          git commit -m 'add new heatmap' || echo "nothing to commit"
-          git push || echo "nothing to push"
+      - name: Read-only preflight
+        run: python -m weread2notionpro.preflight daily
       - name: read time sync
+        if: github.event_name == 'schedule' || inputs.dry_run == false
         run: |
           read_time
       

@@ -1,223 +1,137 @@
 import hashlib
-import json
 import os
 import re
-
 import requests
-from requests.utils import cookiejar_from_dict
-from retrying import retry
-from urllib.parse import quote
+import pendulum
 from dotenv import load_dotenv
 
 load_dotenv()
-WEREAD_URL = "https://weread.qq.com/"
-WEREAD_NOTEBOOKS_URL = "https://i.weread.qq.com/user/notebooks"
-WEREAD_BOOKMARKLIST_URL = "https://i.weread.qq.com/book/bookmarklist"
-WEREAD_CHAPTER_INFO = "https://i.weread.qq.com/book/chapterInfos"
-WEREAD_READ_INFO_URL = "https://i.weread.qq.com/book/readinfo"
-WEREAD_REVIEW_LIST_URL = "https://i.weread.qq.com/review/list"
-WEREAD_BOOK_INFO = "https://i.weread.qq.com/book/info"
-WEREAD_READDATA_DETAIL = "https://i.weread.qq.com/readdata/detail"
-WEREAD_HISTORY_URL = "https://i.weread.qq.com/readdata/summary?synckey=0"
+GATEWAY = "https://i.weread.qq.com/api/agent/gateway"
 
 
 class WeReadApi:
     def __init__(self):
-        self.cookie = self.get_cookie()
+        key = (os.getenv("WEREAD_API_KEY") or "").strip()
+        if not key:
+            candidate = (os.getenv("WEREAD_COOKIE") or "").strip()
+            if candidate.startswith("wrk-"):
+                key = candidate
+        if not key:
+            raise RuntimeError("缺少 WEREAD_API_KEY；请在 GitHub Secrets 配置，不要写入代码或日志。")
         self.session = requests.Session()
-        self.session.cookies = self.parse_cookie_string()
+        self.session.headers.update({"Authorization": "Bearer " + key})
 
-    def try_get_cloud_cookie(self, url, id, password):
-        if url.endswith("/"):
-            url = url[:-1]
-        req_url = f"{url}/get/{id}"
-        data = {"password": password}
-        result = None
-        response = requests.post(req_url, data=data)
-        if response.status_code == 200:
+    def request(self, api_name, **params):
+        try:
+            response = self.session.post(GATEWAY, json={
+                "api_name": api_name, "skill_version": "1.0.6", **params}, timeout=30)
+        except requests.RequestException:
+            raise RuntimeError("微信读书网络请求失败") from None
+        if not response.ok:
+            raise RuntimeError(f"微信读书 HTTP {response.status_code}: {api_name}")
+        try:
             data = response.json()
-            cookie_data = data.get("cookie_data")
-            if cookie_data and "weread.qq.com" in cookie_data:
-                cookies = cookie_data["weread.qq.com"]
-                cookie_str = "; ".join(
-                    [f"{cookie['name']}={cookie['value']}" for cookie in cookies]
-                )
-                result = cookie_str
-        return result
-
-    def get_cookie(self):
-        url = os.getenv("CC_URL")
-        if not url:
-            url = "https://cookiecloud.malinkang.com/"
-        id = os.getenv("CC_ID")
-        password = os.getenv("CC_PASSWORD")
-        cookie = os.getenv("WEREAD_COOKIE")
-        if url and id and password:
-            cookie = self.try_get_cloud_cookie(url, id, password)
-        if not cookie or not cookie.strip():
-            raise Exception("没有找到cookie，请按照文档填写cookie")
-        return cookie
-
-    def parse_cookie_string(self):
-        cookies_dict = {}
-        
-        # 使用正则表达式解析 cookie 字符串
-        pattern = re.compile(r'([^=]+)=([^;]+);?\s*')
-        matches = pattern.findall(self.cookie)
-        
-        for key, value in matches:
-            cookies_dict[key] = value.encode('unicode_escape').decode('ascii')
-        # 直接使用 cookies_dict 创建 cookiejar
-        cookiejar = cookiejar_from_dict(cookies_dict)
-        
-        return cookiejar
+        except ValueError:
+            raise RuntimeError("微信读书返回非 JSON 响应") from None
+        if data.get("errcode", 0):
+            raise RuntimeError(f"微信读书接口失败: {api_name}, errcode={data.get('errcode')}")
+        if data.get("upgrade_info"):
+            print("微信读书接口提示可升级；本次使用已声明的 1.0.6 协议。")
+        return data
 
     def get_bookshelf(self):
-        self.session.get(WEREAD_URL)
-        r = self.session.get(
-            "https://i.weread.qq.com/shelf/sync?synckey=0&teenmode=0&album=1&onlyBookid=0"
-        )
-        if r.ok:
-            return r.json()
-        else:
-            errcode = r.json().get("errcode",0)
-            self.handle_errcode(errcode)
-            raise Exception(f"Could not get bookshelf {r.text}")
-        
-    def handle_errcode(self,errcode):
-        if( errcode== -2012 or errcode==-2010):
-            print(f"::error::微信读书Cookie过期了，请参考文档重新设置。https://mp.weixin.qq.com/s/B_mqLUZv7M1rmXRsMlBf7A")
+        return self.request("/shelf/sync")
 
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def get_notebooklist(self):
-        """获取笔记本列表"""
-        self.session.get(WEREAD_URL)
-        r = self.session.get(WEREAD_NOTEBOOKS_URL)
-        if r.ok:
-            data = r.json()
-            books = data.get("books")
-            books.sort(key=lambda x: x["sort"])
-            return books
-        else:
-            errcode = r.json().get("errcode",0)
-            self.handle_errcode(errcode)
-            raise Exception(f"Could not get notebook list {r.text}")
+        books, cursor = [], None
+        while True:
+            params = {"count": 100}
+            if cursor is not None:
+                params["lastSort"] = cursor
+            data = self.request("/user/notebooks", **params)
+            batch = data.get("books", [])
+            books.extend(batch)
+            if not data.get("hasMore"):
+                return sorted(books, key=lambda x: x.get("sort", 0))
+            next_cursor = batch[-1].get("sort") if batch else None
+            if next_cursor is None or next_cursor == cursor:
+                raise RuntimeError("微信读书笔记分页停滞；未将不完整结果标为成功")
+            cursor = next_cursor
 
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def get_bookinfo(self, bookId):
-        """获取书的详情"""
-        self.session.get(WEREAD_URL)
-        params = dict(bookId=bookId)
-        r = self.session.get(WEREAD_BOOK_INFO, params=params)
-        if r.ok:
-            return r.json()
-        else:
-            errcode = r.json().get("errcode",0)
-            self.handle_errcode(errcode)
-            print(f"Could not get book info {r.text}")
+        return self.request("/book/info", bookId=bookId)
 
-
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def get_bookmark_list(self, bookId):
-        self.session.get(WEREAD_URL)
-        params = dict(bookId=bookId)
-        r = self.session.get(WEREAD_BOOKMARKLIST_URL, params=params)
-        if r.ok:
-            with open("bookmark.json","w") as f:
-                f.write(json.dumps(r.json(),indent=4,ensure_ascii=False))
-            bookmarks = r.json().get("updated")
-            return bookmarks
-        else:
-            errcode = r.json().get("errcode",0)
-            self.handle_errcode(errcode)
-            raise Exception(f"Could not get {bookId} bookmark list")
+        data = self.request("/book/bookmarklist", bookId=bookId)
+        if "updated" not in data:
+            raise RuntimeError("微信读书划线响应缺少 updated")
+        return data["updated"]
 
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
-    def get_read_info(self, bookId):
-        self.session.get(WEREAD_URL)
-        params = dict(
-            noteCount=1,
-            readingDetail=1,
-            finishedBookIndex=1,
-            readingBookCount=1,
-            readingBookIndex=1,
-            finishedBookCount=1,
-            bookId=bookId,
-            finishedDate=1,
-        )
-        headers = {
-            "baseapi":"32",
-            "appver":"8.2.5.10163885",
-            "basever":"8.2.5.10163885",
-            "osver":"12",
-            "User-Agent": "WeRead/8.2.5 WRBrand/xiaomi Dalvik/2.1.0 (Linux; U; Android 12; Redmi Note 7 Pro Build/SQ3A.220705.004)",
-        }
-        r = self.session.get(WEREAD_READ_INFO_URL,headers=headers, params=params)
-        if r.ok:
-            return r.json()
-        else:
-            errcode = r.json().get("errcode",0)
-            self.handle_errcode(errcode)
-            raise Exception(f"get {bookId} read info failed {r.text}")
-
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def get_review_list(self, bookId):
-        self.session.get(WEREAD_URL)
-        params = dict(bookId=bookId, listType=11, mine=1, syncKey=0)
-        r = self.session.get(WEREAD_REVIEW_LIST_URL, params=params)
-        if r.ok:
-            reviews = r.json().get("reviews")
-            reviews = list(map(lambda x: x.get("review"), reviews))
-            reviews = [
-                {"chapterUid": 1000000, **x} if x.get("type") == 4 else x
-                for x in reviews
-            ]
-            return reviews
-        else:
-            errcode = r.json().get("errcode",0)
-            self.handle_errcode(errcode)
-            raise Exception(f"get {bookId} review list failed {r.text}")
+        reviews, cursor = [], 0
+        while True:
+            data = self.request("/review/list/mine", bookid=bookId, synckey=cursor, count=100)
+            for item in data.get("reviews", []):
+                review = item["review"]
+                if review.get("type") == 4:
+                    review = {**review, "chapterUid": 1000000}
+                reviews.append(review)
+            if not data.get("hasMore"):
+                return reviews
+            next_cursor = data.get("synckey")
+            if next_cursor is None or next_cursor == cursor:
+                raise RuntimeError("微信读书想法分页停滞")
+            cursor = next_cursor
 
-
-
-    
-    def get_api_data(self):
-        self.session.get(WEREAD_URL)
-        r = self.session.get(WEREAD_HISTORY_URL)
-        if r.ok:
-            return r.json()
-        else:
-            errcode = r.json().get("errcode",0)
-            self.handle_errcode(errcode)
-            raise Exception(f"get history data failed {r.text}")
-
-    
-
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def get_chapter_info(self, bookId):
-        self.session.get(WEREAD_URL)
-        body = {"bookIds": [bookId], "synckeys": [0], "teenmode": 0}
-        r = self.session.post(WEREAD_CHAPTER_INFO, json=body)
-        if (
-            r.ok
-            and "data" in r.json()
-            and len(r.json()["data"]) == 1
-            and "updated" in r.json()["data"][0]
-        ):
-            update = r.json()["data"][0]["updated"]
-            update.append(
-                {
-                    "chapterUid": 1000000,
-                    "chapterIdx": 1000000,
-                    "updateTime": 1683825006,
-                    "readAhead": 0,
-                    "title": "点评",
-                    "level": 1,
-                }
-            )
-            return {item["chapterUid"]: item for item in update}
-        else:
-            raise Exception(f"get {bookId} chapter info failed {r.text}")
+        data = self.request("/book/chapterinfo", bookId=bookId)
+        if "chapters" not in data:
+            raise RuntimeError("微信读书章节响应缺少 chapters")
+        chapters = {x["chapterUid"]: x for x in data["chapters"]}
+        chapters[1000000] = {"chapterUid": 1000000, "chapterIdx": 1000000,
+                             "title": "点评", "level": 1}
+        return chapters
+
+    def get_read_info(self, bookId):
+        # The public gateway documents cumulative progress, not per-book daily
+        # records. Use the original endpoint only for this missing capability.
+        cookie = (os.getenv("WEREAD_COOKIE") or "").strip()
+        if not cookie or cookie.startswith("wrk-"):
+            raise RuntimeError("逐书逐日阅读明细尚无已验证的新接口；需要有效旧 Cookie，拒绝伪造阅读记录。")
+        try:
+            response = requests.get("https://i.weread.qq.com/book/readinfo",
+                headers={"Cookie": cookie}, params={"bookId": bookId,
+                "readingDetail": 1, "finishedDate": 1}, timeout=30)
+            data = response.json()
+        except (requests.RequestException, ValueError):
+            raise RuntimeError("旧阅读明细接口不可用；尚未恢复阅读记录同步") from None
+        if not response.ok or data.get("errcode", 0) or "readDetail" not in data:
+            raise RuntimeError("旧阅读明细接口未返回有效明细；尚未恢复阅读记录同步")
+        return data
+
+    def get_api_data(self):
+        # Annual readTimes are MONTH buckets; only dailyReadTimes are day rows.
+        year = int(os.getenv("YEAR") or pendulum.now("Asia/Shanghai").year)
+        start = pendulum.datetime(year, 1, 1, tz="Asia/Shanghai")
+        data = self.request("/readdata/detail", mode="annually", baseTime=start.int_timestamp)
+        daily = data.get("dailyReadTimes")
+        if not isinstance(daily, dict):
+            daily = {}
+            now = pendulum.now("Asia/Shanghai")
+            for month in range(1, 13):
+                date = start.replace(month=month)
+                if date > now:
+                    break
+                detail = self.request("/readdata/detail", mode="monthly", baseTime=date.int_timestamp)
+                buckets = detail.get("readTimes")
+                if not isinstance(buckets, dict):
+                    raise RuntimeError("每日阅读统计缺失；拒绝把汇总值写成日记录")
+                daily.update(buckets)
+        for key in daily:
+            date = pendulum.from_timestamp(int(key), tz="Asia/Shanghai")
+            if date.year != year or date != date.start_of("day"):
+                raise RuntimeError("阅读统计时间桶不是目标年度的日零点")
+        return {"readTimes": daily}
 
     def transform_id(self, book_id):
         id_length = len(book_id)
